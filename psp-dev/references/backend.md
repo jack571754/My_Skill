@@ -90,6 +90,17 @@ class MyDocType(Document):
 
 ## 2. API 开发
 
+### 装饰器使用
+
+项目提供两个装饰器，**不存在 `@api_endpoint` 组合装饰器**：
+
+```python
+from product_sales_planning.utils.api_decorators import handle_exceptions, with_transaction
+```
+
+- `@handle_exceptions` — 统一异常处理，捕获 ValidationError/PermissionError/DoesNotExistError/通用异常，返回 `error_response`
+- `@with_transaction` — 事务管理，自动 `begin`/`commit`/`rollback`
+
 ### 基础查询 API
 
 ```python
@@ -99,15 +110,11 @@ My API - XXX相关API接口
 """
 import frappe
 from product_sales_planning.utils.response_utils import success_response, error_response
-from product_sales_planning.utils.api_decorators import (
-    handle_exceptions,
-    require_permission,
-    api_endpoint
-)
-from product_sales_planning.constants import MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE
+from product_sales_planning.utils.api_decorators import handle_exceptions
+from product_sales_planning.constants import MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE, ErrorCode
 
 @frappe.whitelist()
-@api_endpoint(doctype="My DocType", perm_type="read")
+@handle_exceptions
 def get_list(filters=None, page=1, page_size=DEFAULT_PAGE_SIZE):
     """获取列表数据"""
     filters = frappe.parse_json(filters) if filters else {}
@@ -133,11 +140,12 @@ def get_list(filters=None, page=1, page_size=DEFAULT_PAGE_SIZE):
     })
 ```
 
-### 写操作 API（带权限和事务）
+### 写操作 API（带事务）
 
 ```python
 @frappe.whitelist()
-@api_endpoint(doctype="My DocType", perm_type="write", require_transaction=True)
+@handle_exceptions
+@with_transaction
 def update_data(name, **kwargs):
     """更新数据"""
     doc = frappe.get_doc("My DocType", name)
@@ -154,7 +162,8 @@ def update_data(name, **kwargs):
 
 ```python
 @frappe.whitelist()
-@api_endpoint(doctype="My DocType", perm_type="create", require_transaction=True)
+@handle_exceptions
+@with_transaction
 def batch_create(items):
     """批量创建"""
     items = frappe.parse_json(items)
@@ -178,7 +187,26 @@ def batch_create(items):
     })
 ```
 
+### 带参数验证的 API
+
+```python
+from product_sales_planning.utils.validation_utils import validate_required_params, validate_positive_integer
+
+@frappe.whitelist()
+@handle_exceptions
+def get_detail(name):
+    """获取详情"""
+    validate_required_params({"name": name}, ["name"])
+
+    doc = frappe.get_doc("My DocType", name)
+    return success_response(data=doc.as_dict())
+```
+
 ## 3. 服务层开发
+
+服务层有两种风格——类风格和模块函数风格，根据复杂度选择：
+
+### 类风格（适合复杂业务，如 CommodityScheduleService）
 
 ```python
 # services/my_service.py
@@ -220,18 +248,62 @@ class MyService:
             raise
 ```
 
-## 4. ClickHouse 查询
+### 模块函数风格（适合通知、配置等扁平逻辑，如 approval_service.py）
 
 ```python
-from product_sales_planning.utils.clickhouse_client import execute_query, execute_query_df
+# services/my_notification_service.py
+"""通知服务"""
+import frappe
 
+def send_notification(user, title, message, notification_type="info"):
+    """发送通知"""
+    # 直接使用模块级函数
+    pass
+```
+
+### 服务层常用工具
+
+```python
+from product_sales_planning.utils.date_utils import get_date_range_filter, get_month_first_day
+from product_sales_planning.utils.validation_utils import validate_required_params, validate_positive_integer, validate_doctype_exists
+from product_sales_planning.constants import DEFAULT_PLAN_MONTHS
+```
+
+## 4. ClickHouse 查询
+
+### 连接配置
+
+ClickHouse 通过 HTTP 协议连接，配置优先级：`frappe.conf` > `DEFAULT_CLICKHOUSE_CONFIG`。
+
+```python
+from product_sales_planning.utils.clickhouse_client import get_client
+
+# 获取客户端实例（模块级单例）
+client = get_client()
+```
+
+### 安全的表名引用
+
+```python
+from product_sales_planning.utils.clickhouse_client import format_clickhouse_table_ref, get_clickhouse_table_ref
+
+# 安全引用表名（自动添加反引号）
+table = format_clickhouse_table_ref("smartbimpp.sales_data")  # → `smartbimpp`.`sales_data`
+
+# 按配置键优先级查找表名
+table = get_clickhouse_table_ref(["clickhouse_sales_table", "default_sales_table"], "sales_data")
+```
+
+### 查询示例
+
+```python
 # 执行查询返回列表
-result = execute_query("""
+result = client.query("""
     SELECT
         store_id,
         product_code,
         SUM(quantity) as total_qty
-    FROM sales_data
+    FROM `smartbimpp`.`sales_data`
     WHERE date >= '2025-01-01'
     GROUP BY store_id, product_code
     ORDER BY total_qty DESC
@@ -239,11 +311,7 @@ result = execute_query("""
 """)
 
 # 执行查询返回 DataFrame
-df = execute_query_df("SELECT * FROM sales_data LIMIT 100")
-
-# 测试连接
-from product_sales_planning.utils.clickhouse_client import test_connection
-test_connection()
+df = client.query_df("SELECT * FROM `smartbimpp`.`sales_data` LIMIT 100")
 ```
 
 项目有两个分析路径：
@@ -256,7 +324,17 @@ test_connection()
 
 ## 5. 缓存服务
 
-缓存服务是面向分析场景的专用缓存，不是通用 key-value 缓存。通过 `get_cache_service()` 获取单例实例。
+`AnalysisCacheService` 是面向分析场景的专用 Redis 缓存，通过 `frappe.cache()` 连接，不是通用 key-value 缓存。
+
+### 缓存 TTL
+
+| 类型 | TTL | 说明 |
+|------|-----|------|
+| 筛选选项 | 10 分钟 | `FILTER_OPTIONS_TTL = 600` |
+| 统计数据 | 5 分钟 | `STATS_TTL = 300` |
+| 分析数据 | 3 分钟 | `DATA_TTL = 180` |
+
+### 使用方式
 
 ```python
 from product_sales_planning.utils.cache_service import get_cache_service
@@ -267,20 +345,22 @@ cache = get_cache_service()
 cache.set_analysis_data(task_id, store_id, data)
 data = cache.get_analysis_data(task_id, store_id)
 
-# 设置/获取筛选选项
-cache.set_filter_options(task_id, options)
-options = cache.get_filter_options(task_id)
-
-# 设置/获取统计信息
-cache.set_stats_data(task_id, stats)
-stats = cache.get_stats_data(task_id)
-
 # 失效操作
 cache.invalidate_by_store(store_id)
 cache.invalidate_by_task(task_id)
 cache.invalidate_user_cache(user)
 cache.invalidate_all()
 ```
+
+### 降级策略
+
+所有缓存操作都使用 `_safe_*` 方法包装，Redis 不可用时返回 `None`/`False`，不抛异常。调用方应将 `None` 视为缓存未命中。
+
+### 缓存键结构
+
+- 筛选选项：`psp_analysis:filter_options:{user_id}`
+- 分析数据：`psp_analysis:analysis:{user_id}:{dimension}:{filters_hash}:{page}:{page_size}`
+- 统计数据：`psp_analysis:stats:{user_id}:{filters_hash}`
 
 缓存失效钩子在 `utils/cache_hooks.py`，通过 `hooks.py → doc_events` 自动触发。
 
@@ -305,3 +385,5 @@ class TestMyDocType(FrappeTestCase):
     def tearDown(self):
         frappe.delete_doc("My DocType", "TEST001")
 ```
+
+运行命令：`bench --site <site> run-tests --app product_sales_planning --module product_sales_planning.planning_system.doctype.my_doctype`

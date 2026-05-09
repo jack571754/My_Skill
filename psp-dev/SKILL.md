@@ -38,22 +38,24 @@ description: |
 ```
 product_sales_planning/
 ├── product_sales_planning/          # Python 后端
-│   ├── api/v1/                      # REST API (26个文件)
-│   ├── planning_system/doctype/     # DocType (25个模块)
-│   ├── services/                    # 业务逻辑层 (8个服务)
-│   ├── utils/                       # 工具函数 (14个)
-│   ├── overrides/                   # Frappe 框架覆写 (OAuth/用户/Workspace)
-│   ├── patches/                     # 数据库补丁 (6个)
+│   ├── api/v1/                      # REST API（24 个端点文件）
+│   ├── planning_system/doctype/     # DocType（25 个模块）
+│   ├── services/                    # 业务逻辑层（8 个服务）
+│   ├── utils/                       # 工具函数（13 个）
+│   ├── overrides/                   # Frappe 框架覆写（OAuth/用户/Workspace）
+│   ├── patches/                     # 数据库补丁（7 个）
 │   ├── commands/                    # bench 自定义命令
-│   ├── www/                         # Frappe 门户页面 (5个)
+│   ├── www/                         # Frappe 门户页面（5 个）
 │   └── constants.py                 # 状态常量、错误码、分页限制
 ├── frontend/                        # Vue 3 前端
-│   ├── src/pages/                   # 页面组件 (7个)
-│   ├── src/components/              # 通用组件 (30+)
-│   ├── src/composables/             # 组合式函数 (6个)
-│   ├── src/stores/                  # 响应式状态 (permissionStore, Vue reactive)
-│   ├── src/api/                     # API 调用层 (2个)
-│   ├── src/config/                  # 权限配置
+│   ├── src/pages/                   # 页面组件（6 个）
+│   ├── src/components/              # 通用组件（17 个，含子目录）
+│   ├── src/composables/             # 组合式函数（5 个）
+│   ├── src/stores/                  # 响应式状态（permissionStore，Vue reactive 实现）
+│   ├── src/api/                     # API 调用层
+│   ├── src/config/                  # 权限配置 + 审批状态配置
+│   ├── src/utils/                   # 工具函数（frappeRequest/cacheManager 等）
+│   ├── src/layouts/                 # 布局组件（MainLayout）
 │   └── src/router/                  # 路由 + 守卫
 └── public/planning/                 # 构建输出
 ```
@@ -66,29 +68,41 @@ product_sales_planning/
 Browser (/planning/*)
   → Vite dev proxy (dev) / Nginx (prod)
   → Frappe www/planning.py (SPA shell)
-  → Vue Router → Page → Composable → API
-  → frappe.call() → /api/method/product_sales_planning.api.v1.*
+  → Vue Router → MainLayout → Page → Composable → API
+  → frappeRequest / frappe.call → /api/method/product_sales_planning.api.v1.*
   → MariaDB / ClickHouse
 ```
 
 ### 2. API 装饰器链
 
-优先使用 `@api_endpoint` 组合装饰器，它封装了权限检查、异常处理和事务管理。仅在需要精细控制时才拆分为 `@handle_exceptions` + `@require_permission`。
+项目提供两个装饰器，按需组合使用。**注意：项目中不存在 `@api_endpoint` 组合装饰器，不要引用。**
 
 ```python
-# 推荐写法
-@frappe.whitelist()
-@api_endpoint(doctype="DocType Name", perm_type="write", require_transaction=True)
-def my_api():
-    pass
-
-# 需要精细控制时拆分
+# 标准写法：@handle_exceptions 处理异常并返回统一格式
 @frappe.whitelist()
 @handle_exceptions
-@require_permission("DocType Name", "read")
-def my_api():
+def my_read_api():
     pass
+
+# 写操作：加上 @with_transaction 管理事务
+@frappe.whitelist()
+@handle_exceptions
+@with_transaction
+def my_write_api():
+    pass
+
+# 需要权限检查时：手动调用权限工具
+from product_sales_planning.utils.api_decorators import handle_exceptions, with_transaction
+from product_sales_planning.utils.validation_utils import validate_required_params
 ```
+
+`@handle_exceptions` 会捕获 4 类 Frappe 异常并映射为 `error_response`：
+- `ValidationError` → `VALIDATION_ERROR`
+- `PermissionError` → `PERMISSION_DENIED`
+- `DoesNotExistError` → `NOT_FOUND`
+- 其他 → `INTERNAL_ERROR`
+
+`@with_transaction` 自动管理 `frappe.db.begin()` / `commit()` / `rollback()`。
 
 ### 3. 统一响应格式
 
@@ -99,16 +113,59 @@ from product_sales_planning.utils.response_utils import success_response, error_
 from product_sales_planning.constants import ErrorCode
 
 return success_response(data={"items": [...]})
+return success_response(data=result, message="操作成功")
 return error_response(message="操作失败", error_code=ErrorCode.VALIDATION_ERROR)
 ```
 
-### 4. 缓存失效
+响应结构：`success` → `{"status": "success", "message": "...", "data": ...}`，`error` → `{"status": "error", "message": "...", "error_code": "..."}`。两者均支持 `**kwargs` 扩展字段。
+
+### 4. 前端请求方式
+
+项目使用自定义 `frappeRequest`（`src/utils/frappeRequest.js`）替代 frappe-ui 默认 request，核心功能：
+- CSRF token 三源获取（cookie → `window.csrf_token` → `window.frappe.csrf_token`）
+- CSRF 错误自动刷新 token 并重试
+- GET 参数用 `URLSearchParams`，POST 用 JSON body
+- 自动前缀 `/api/method/`
+
+Composable 中优先使用 `createResource`（frappe-ui）管理 API 资源，配合 `frappeRequest`：
+```javascript
+const resource = createResource({
+    url: 'product_sales_planning.api.v1.my_api.get_data',
+    makeParams: () => ({ task_id, store_id }),
+    auto: false,
+    transform: (res) => {
+        const data = res?.message || res
+        return data?.status === 'success' ? data.data : null
+    }
+})
+```
+
+### 5. 前端状态管理
+
+**重要：`permissionStore` 不是 Pinia store，而是基于 Vue `reactive`/`readonly` 的响应式对象。**
+- 使用时直接调用方法：`permissionStore.hasRole('System Manager')`，不需要加括号调用
+- 三级数据源优先级：`window.boot` > `sessionStorage` 缓存 > API 请求
+- 缓存 TTL 5 分钟，存储在 `sessionStorage`
+
+### 6. 前端 Composable 模式
+
+页面逻辑提取到 `composables/use*.js`，保持页面组件精简。项目现有 5 个 composable：
+- `useApproval.js` — 审批流程（5 个 createResource）
+- `useFixedReport.js` — 固定报表
+- `useNotification.js` — 通知系统
+- `usePermission.js` — 权限检查
+- `useStoreDetail.js` — 店铺详情（最复杂，含数据加载/筛选/保存/导出/列设置）
+
+### 7. 前端布局
+
+`MainLayout.vue` 提供 Sidebar + TopBar + ErrorBoundary + 全局通知弹窗的框架结构。
+- `DataAnalysis` 页面使用 `keep-alive` 缓存
+- `Suspense` 提供加载状态 fallback
+- 路由守卫 `createPermissionGuard()` 检查页面权限
+
+### 8. 缓存失效
 
 `doc_events` 注册在 `hooks.py` 中，当 `Commodity Schedule` 或 `Approval Instance` 变更时自动清除分析缓存。`Permission Config` 变更时清除权限缓存。新增 DocType 如需缓存失效行为，在 `utils/cache_hooks.py` 添加并注册到 `hooks.py → doc_events`。
-
-### 5. 前端 Composable 模式
-
-页面逻辑提取到 `composables/use*.js`，保持页面组件精简。API 调用封装到 `api/` 层。这很重要——项目已有 6 个 composable，新功能应遵循相同模式。
 
 ## 详细开发模板
 
@@ -123,25 +180,71 @@ return error_response(message="操作失败", error_code=ErrorCode.VALIDATION_ER
 这些是 PSP 项目中容易踩坑的地方，开发时务必注意：
 
 1. **Frappe API 参数类型**：`@frappe.whitelist()` 的参数都从请求序列化为字符串，必须手动 `int()` / `frappe.parse_json()` 转换。模板中已体现此模式，不要省略。
+
 2. **Module 名大小写**：DocType JSON 中 `module` 字段必须为 `"planning system"`（全小写），这是 Frappe 的 module 命名约定，大写会导致找不到模块。
+
 3. **API 路径格式**：所有 API 调用路径为 `product_sales_planning.api.v1.file_name.function_name`，注意是下划线文件名，不是驼峰。
+
 4. **ignore_permissions 与权限检查**：API 装饰器已做权限检查，所以 `doc.save(ignore_permissions=True)` 是正确的——不要同时使用装饰器检查权限又让 ORM 再检查一次。
+
 5. **前端构建输出**：`npm run build` 输出到 `public/planning/`，这些文件会被 Git 追踪。构建后需确认输出正确。
+
 6. **Handsontable 许可**：项目使用 Handsontable 商业版，不要更换为社区版。
+
+7. **`@api_endpoint` 不存在**：项目中没有 `@api_endpoint` 装饰器，只有 `@handle_exceptions` 和 `@with_transaction`。不要在代码中引用不存在的装饰器。
+
+8. **前端 createResource 的 transform**：frappe-ui 的 `createResource` 返回的数据可能在 `res.message` 或直接在 `res` 中，transform 中需要兼容两种情况：`const data = res?.message || res`。
+
+9. **计划数量显示**：数量为 0 时前端显示为空字符串，避免误导为已提报 0。参考 `useStoreDetail.js` 中的 `formatPlanQuantityForTable`。
 
 ## 核心常量速查
 
+### 状态常量
+
+| 类 | 常量 | 值 |
+|------|------|------|
+| `ApprovalStatus` | PENDING / APPROVED / REJECTED | 待审批 / 已通过 / 已驳回 |
+| `SubmissionStatus` | NOT_STARTED / SUBMITTED | 未开始 / 已提交 |
+| `TaskStatus` | NOT_STARTED / IN_PROGRESS / COMPLETED / CLOSED | 未开始 / 开启中 / 已完成 / 已关闭 |
+| `ViewMode` | SINGLE / MULTI | single / multi |
+
+### 错误码
+
 | 常量 | 值 |
 |------|------|
-| `ApprovalStatus` | 待审批 / 已通过 / 已驳回 |
-| `SubmissionStatus` | 未开始 / 已提交 |
-| `TaskStatus` | 未开始 / 开启中 / 已完成 / 已关闭 |
+| `ErrorCode.VALIDATION_ERROR` | VALIDATION_ERROR |
+| `ErrorCode.PERMISSION_DENIED` | PERMISSION_DENIED |
+| `ErrorCode.NOT_FOUND` | NOT_FOUND |
+| `ErrorCode.DUPLICATE` | DUPLICATE |
+| `ErrorCode.INTERNAL_ERROR` | INTERNAL_ERROR |
+| `ErrorCode.INVALID_PARAMETER` | INVALID_PARAMETER |
+| `ErrorCode.TRANSACTION_FAILED` | TRANSACTION_FAILED |
+
+### DocType 名称常量
+
+| 常量 | 值 |
+|------|------|
+| `DocType.COMMODITY_SCHEDULE` | Commodity Schedule |
+| `DocType.STORE_LIST` | Store List |
+| `DocType.PRODUCT_LIST` | Product List |
+| `DocType.SCHEDULE_TASKS` | Schedule Tasks |
+| `DocType.TASKS_STORE` | Tasks Store |
+| `DocType.APPROVAL_WORKFLOW` | Approval Workflow |
+
+### 分页与限制
+
+| 常量 | 值 |
+|------|------|
 | `MAX_PAGE_SIZE` | 1000 |
 | `DEFAULT_PAGE_SIZE` | 20 |
+| `MIN_PAGE_SIZE` | 1 |
+| `MAX_BATCH_SIZE` | 1000 |
 | `MAX_IMPORT_ROWS` | 10000 |
 | `MAX_EXPORT_ROWS` | 50000 |
+| `MAX_FILE_SIZE_MB` | 10 |
 | `DEFAULT_PLAN_MONTHS` | 5 |
 | `ALLOWED_FILE_EXTENSIONS` | .xlsx, .xls |
+| `COMMODITY_EDITABLE_FIELDS` | ["quantity", "sub_date"] |
 
 ## 路由映射
 
@@ -150,9 +253,8 @@ return error_response(message="操作失败", error_code=ErrorCode.VALIDATION_ER
 | `/` | PlanningDashboard | 计划看板 |
 | `/approval-center` | ApprovalCenter | 审批中心 |
 | `/mechanism` | MechanismManagement | 机制管理 |
-| `/data-analysis` | DataAnalysis | 数据分析（含透视表） |
-| `/data-view` | DataView → redirect | 数据查看 |
-| `/store-detail/:storeId/:taskId` | StoreDetail | 店铺详情 |
+| `/data-analysis` | DataAnalysis | 数据分析（含透视表，keep-alive 缓存） |
+| `/store-detail/:storeId/:taskId` | StoreDetail | 店铺详情（beforeEnter 校验参数） |
 | `/no-access` | NoAccess | 无权限 |
 
 ## 代码规范
@@ -198,7 +300,7 @@ cd frontend && npm run test         # vitest --run
 ### 添加新 API 端点
 
 1. 在 `api/v1/` 创建或修改文件
-2. 使用 `@frappe.whitelist()` + 装饰器链
+2. 使用 `@frappe.whitelist()` + `@handle_exceptions`（+ `@with_transaction` 按需）
 3. 返回 `success_response` / `error_response`
 4. 如需在 `hooks.py` 注册 `api_methods`
 

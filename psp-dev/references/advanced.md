@@ -32,10 +32,13 @@
 | 已驳回 | `ApprovalStatus.REJECTED` | 审批驳回 |
 | 已撤回 | — | 提交人撤回 |
 
+前端可提交状态：`['未开始', '已撤回', '已驳回']`（定义在 `useApproval.js` 的 `SUBMITTABLE_STATUSES`）
+
 ### 审批相关 DocType
 
 - `approval_instance` — 审批实例
 - `approval_history` — 审批历史
+- `approval_config` — 审批配置（步骤和审批人）
 
 ### 审批 API
 
@@ -55,6 +58,27 @@ approve(task_id, store_id, approver, comments)
 reject(task_id, store_id, approver, comments, reject_to_step)
 withdraw(task_id, store_id, submitter)
 ```
+
+### 审批前端
+
+`useApproval.js` composable 提供 5 个 `createResource`：
+- `statusResource` — 获取审批状态
+- `historyResource` — 获取审批历史
+- `submitResource` — 提交审批
+- `withdrawResource` — 撤回审批
+- `approveResource` — 审批通过
+
+状态映射（定义在 `useApproval.js`）：
+- `STATUS_TEXT_MAP` — 状态 → 显示文本
+- `STATUS_THEME_MAP` — 状态 → frappe-ui Badge 主题色
+
+### 审批通知
+
+审批服务自动通过 `send_approval_notification` 发送通知，类型有：
+- `pending` — 待审批通知（发给审批人）
+- `approved` — 审批通过通知（发给提交人）
+- `rejected` — 驳回通知（发给提交人或上一级审批人）
+- `withdrawn` — 撤回通知（发给当前审批人）
 
 ### 审批配置
 
@@ -89,13 +113,17 @@ Permission Config (权限配置)
 ### 后端权限检查
 
 ```python
-# API 层
-from product_sales_planning.utils.api_decorators import require_permission
+# API 层 — 使用装饰器或手动验证
+from product_sales_planning.utils.api_decorators import handle_exceptions
 
 @frappe.whitelist()
-@require_permission("Commodity Schedule", "write")
-def update_data():
-    pass
+@handle_exceptions
+def update_data(name):
+    # 手动权限检查
+    from product_sales_planning.services.permission_config_service import PermissionConfigService
+    if not PermissionConfigService.check_permission(frappe.session.user, name, "write"):
+        frappe.throw("无权限操作", frappe.PermissionError)
+    ...
 
 # DocType 层
 class MyDocType(Document):
@@ -108,9 +136,12 @@ class MyDocType(Document):
 
 ### 前端权限
 
-- `permissionStore`（Pinia）— 用户角色和页面权限缓存
+- `permissionStore`（Vue `reactive`，**不是 Pinia**）— 用户角色和页面权限缓存
+  - 三级数据源：`window.boot` > `sessionStorage` > API 请求
+  - 缓存 TTL 5 分钟
+  - 直接作为对象使用：`permissionStore.hasRole('System Manager')`
 - `permissionGuard.js` — 路由守卫，拦截无权限访问
-- `permissions.js` — 页面权限配置映射
+- `permissions.js` — 页面权限配置映射，含 `canAccessRoute()`、`hasRole()`、`getVisibleMenus()`
 
 ### 店铺列表特殊权限
 
@@ -127,7 +158,10 @@ class MyDocType(Document):
 # - 处理飞书 OAuth 回调
 # - 自动创建/关联 Frappe 用户
 # - 重定向到 /planning 而非 /app
+# - 更新登录上下文（update_login_context）
 ```
+
+飞书 Social Login Key 作为 fixture 预加载（`hooks.py → fixtures`）。
 
 ### 飞书通知
 
@@ -156,7 +190,6 @@ FeishuNotification.send_message(
 ```python
 # hooks.py scheduler_events
 scheduler_events = {
-    "daily": ["product_sales_planning.planning_system.doctype.schedule_tasks.schedule_tasks.auto_close_expired_tasks"],
     "hourly": ["product_sales_planning.planning_system.doctype.schedule_tasks.schedule_tasks.auto_close_expired_tasks"]
 }
 ```
@@ -186,6 +219,7 @@ ReminderService.send_reminder(task_id="TASK001")
 # - 导出 Commodity Schedule 为 Excel
 # - 支持 .xlsx / .xls 格式
 # - 最大导入行数 10000，导出 50000
+# - 最大文件大小 10MB
 ```
 
 ### 前端
@@ -202,16 +236,28 @@ ReminderService.send_reminder(task_id="TASK001")
 | MariaDB | `data_analysis.py` | Frappe DB | 小数据量、实时查询 |
 | ClickHouse | `data_analysis_clickhouse.py` | ClickHouse | 大数据量、聚合分析 |
 
+### 查询优化
+
+`OptimizedQueryBuilder`（`utils/query_builder.py`）提供 SQL 查询优化：
+- 使用 JOIN 替代 IN 子查询
+- 使用 EXISTS 替代大量 OR 条件
+- 数据库层面分页（LIMIT OFFSET）
+- 合并多个独立查询为单个查询
+
+核心表别名：`cs`(Commodity Schedule)、`ai`(Approval Instance)、`sl`(Store List)、`pl`(Product List)
+
+支持维度：`detail`（明细）、`store`（店铺汇总）、`product`（商品汇总）
+
 ### 分析功能
 
-- **透视分析** — `data_analysis_pivot.py` + `usePivotAnalysis.js` + `pivot/` 组件
-- **固定报表** — `data_analysis_fixed_report.py` + `useFixedReport.js` + `fixed-report/` 组件
+- **透视分析** — `data_analysis_pivot.py` + 透视组件
+- **固定报表** — `data_analysis_fixed_report.py` + `useFixedReport.js` + `FixedReportTable.vue`
 - **计划对比** — `plan_comparison.py`
-- **数据查看** — `data_view.py`
+- **规则引擎** — `planningRuleEngine.js`（前端规则评估，支持跨任务对比）
 
 ### ClickHouse 工具
 
-- `clickhouse_client.py` — 连接客户端
+- `clickhouse_client.py` — 连接客户端（HTTP 协议，模块级单例）
 - `clickhouse_sales.py` — 销售数据查询
 - `clickhouse_materialized_views.py` — 物化视图管理
 
@@ -244,7 +290,7 @@ NotificationService.notify(
 
 ### 用户钩子
 
-`overrides/user_hooks.py` — 新用户创建时屏蔽所有模块（`before_insert`）
+`overrides/user_hooks.py` — 新用户创建时屏蔽所有模块（`before_insert`，通过 `doc_events` 注册）
 
 ### Workspace 覆写
 
@@ -255,29 +301,41 @@ NotificationService.notify(
 ```python
 # hooks.py
 after_install = "product_sales_planning.install.after_install"
-after_migrate = "product_sales_planning.install.after_migrate"
+after_migrate = ["product_sales_planning.install.after_migrate"]
 ```
+
+### Boot Session 过滤
+
+`hooks.py → boot_session` 注册 `filter_help_dropdown`，过滤掉帮助下拉中的 "Frappe Support" 项。
 
 ## 9. 其他工具
 
 ### 日期工具
 
 `utils/date_utils.py` — 日期计算、计划月份推算
+- `get_date_range_filter` — 日期范围筛选
+- `get_month_first_day` — 获取月份第一天
 
 ### 查询构建器
 
-`utils/query_builder.py` — SQL 查询构建辅助
+`utils/query_builder.py` — `OptimizedQueryBuilder` 类，SQL 查询构建辅助
 
 ### 验证工具
 
 `utils/validation_utils.py` — 输入校验工具函数
+- `validate_required_params` — 必填参数验证
+- `validate_positive_integer` — 正整数验证
+- `validate_doctype_exists` — DocType 存在性验证
 
-### API 文档生成
+### 前端工具
 
-`utils/docs/api_doc_generator.py` — 自动生成 API 文档
+- `frappeRequest.js` — 自定义请求函数，CSRF token 管理 + 自动重试
+- `cacheManager.ts` — 前端缓存管理
+- `pivotConfigStorage.js` — 透视配置持久化
+- `planningRuleEngine.js` — 计划规则引擎（`PlanningRuleEvaluator` 类）
+- `helpers.js` — 通用工具（debounce、formatTime）
 
-### 测试数据生成
+### 测试与修复
 
-`api/v1/generate_test_data.py` — 生成测试数据
-`utils/generate_test_data_directly.py` — 直接生成测试数据
-`commands/repair_data.py` — bench 数据修复命令
+- `utils/generate_test_data_directly.py` — 直接生成测试数据
+- `commands/repair_data.py` — bench 数据修复命令
